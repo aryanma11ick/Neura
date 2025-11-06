@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Form, Body
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
@@ -8,10 +8,11 @@ import google_auth_oauthlib.flow
 import googleapiclient.discovery
 from groq import Groq
 from twilio.rest import Client
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
-import re
-import os
+import json, os, re, pytz
+from dateutil import parser as dateutil_parser
+from dateutil.relativedelta import relativedelta
 
 # ----------------------------
 # Load environment variables
@@ -147,53 +148,18 @@ async def callback(request: Request):
             print(f"🆕 Added new Google token for {whatsapp_id}")
         await session.commit()
 
-    try:
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{whatsapp_id}",
-            body="✅ Google Calendar linked! You can now ask me to show or add events."
-        )
-    except Exception as e:
-        print(f"⚠️ WhatsApp send failed: {e}")
+    twilio_client.messages.create(
+        from_=TWILIO_WHATSAPP_NUMBER,
+        to=f"whatsapp:{whatsapp_id}",
+        body="✅ Google Calendar linked! You can now ask me to show or add events."
+    )
 
     return HTMLResponse("<h2>✅ Linked! You can return to WhatsApp now.</h2>")
 
 # ----------------------------
-# Internal helper to fetch events (no HTTP)
+# Internal helper: Add Event
 # ----------------------------
-async def get_calendar_events(whatsapp_id: str):
-    async with async_session() as session:
-        result = await session.execute(select(GoogleToken).where(GoogleToken.whatsapp_id == whatsapp_id))
-        token = result.scalars().first()
-        if not token:
-            return None, "⚠️ Not linked yet. Say *link* to connect your Google Calendar."
-
-        creds = google.oauth2.credentials.Credentials.from_authorized_user_info({
-            "token": token.access_token,
-            "refresh_token": token.refresh_token,
-            "token_uri": token.token_uri,
-            "client_id": token.client_id,
-            "client_secret": token.client_secret,
-            "scopes": token.scopes
-        }, SCOPES)
-
-        try:
-            service = googleapiclient.discovery.build("calendar", "v3", credentials=creds)
-            events_result = service.events().list(
-                calendarId="primary", maxResults=5, singleEvents=True, orderBy="startTime"
-            ).execute()
-            events = events_result.get("items", [])
-            if not events:
-                return [], "✅ You have no upcoming events."
-            formatted = [f"{e.get('summary', 'No title')} at {e['start'].get('dateTime', e['start'].get('date'))}" for e in events]
-            return formatted, None
-        except Exception as e:
-            return None, f"❌ Error fetching events: {e}"
-
-# ----------------------------
-# Internal helper to add event (no HTTP)
-# ----------------------------
-async def add_calendar_event(whatsapp_id: str, summary: str, start_time: str, end_time: str):
+async def add_calendar_event(whatsapp_id: str, summary: str, start_time: str, end_time: str, description: str = ""):
     async with async_session() as session:
         result = await session.execute(select(GoogleToken).where(GoogleToken.whatsapp_id == whatsapp_id))
         token = result.scalars().first()
@@ -209,20 +175,18 @@ async def add_calendar_event(whatsapp_id: str, summary: str, start_time: str, en
             "scopes": token.scopes
         }, SCOPES)
 
-        try:
-            service = googleapiclient.discovery.build("calendar", "v3", credentials=creds)
-            event = {
-                "summary": summary,
-                "start": {"dateTime": start_time, "timeZone": "Asia/Kolkata"},
-                "end": {"dateTime": end_time, "timeZone": "Asia/Kolkata"},
-            }
-            service.events().insert(calendarId="primary", body=event).execute()
-            return "✅ Event created successfully!"
-        except Exception as e:
-            return f"❌ Couldn't add event: {e}"
+        service = googleapiclient.discovery.build("calendar", "v3", credentials=creds)
+        event = {
+            "summary": summary,
+            "description": description,
+            "start": {"dateTime": start_time, "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end_time, "timeZone": "Asia/Kolkata"},
+        }
+        service.events().insert(calendarId="primary", body=event).execute()
+        return f"✅ Event '{summary}' created successfully for {start_time}!"
 
 # ----------------------------
-# WhatsApp Webhook (non-blocking)
+# WhatsApp Webhook
 # ----------------------------
 @app.post("/webhook")
 async def webhook(From: str = Form(...), Body: str = Form(...)):
@@ -234,52 +198,89 @@ async def webhook(From: str = Form(...), Body: str = Form(...)):
     print(f"📩 Incoming from {whatsapp_id}: {msg}")
     reply = ""
 
-    # Link calendar
+    # 1️⃣ Link Calendar
     if "link" in msg or "connect" in msg:
         reply = f"🔗 Tap here to link your Google Calendar:\n{NGROK_URL}/auth?whatsapp_id={whatsapp_id}"
 
-    # Show schedule
-    elif "show" in msg or "schedule" in msg:
-        events, error = await get_calendar_events(whatsapp_id)
-        if error:
-            reply = error
-        else:
-            reply = "📅 Upcoming events:\n" + "\n".join(f"- {e}" for e in events)
+    # 2️⃣ Add Event (LLM-powered)
+    elif any(word in msg for word in ["add", "meeting", "event", "schedule", "create"]):
+        try:
+            system_prompt = f"""
+            You are a helpful assistant that extracts event details for Google Calendar.
+            The current date/time is {datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()}.
+            Output STRICTLY valid JSON only in this format:
+            {{
+              "summary": "Event title",
+              "start_time": "YYYY-MM-DDTHH:MM:SS+05:30",
+              "end_time": "YYYY-MM-DDTHH:MM:SS+05:30",
+              "description": "Optional short description"
+            }}
+            Use Asia/Kolkata timezone. If the user says 'tomorrow', 'next week', or similar, compute the correct future date.
+            Duration default = 1 hour. NEVER use a past date.
+            """
 
-    # Add event
-    elif "add" in msg or "meeting" in msg:
-        match = re.search(r"add (?:a )?(?:meeting )?(.*?) at (\d+)(?::(\d+))?\s*(am|pm)?", msg)
-        if match:
-            summary = match.group(1).strip().capitalize() or "Meeting"
-            hour, minute, ampm = int(match.group(2)), int(match.group(3) or 0), match.group(4)
-            if ampm and ampm.lower() == "pm" and hour < 12:
-                hour += 12
-            now = datetime.now()
-            start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            end = start + timedelta(hours=1)
-            reply = await add_calendar_event(whatsapp_id, summary, start.isoformat(), end.isoformat())
-        else:
-            reply = "⚠️ Try 'Add meeting with Aryan at 4 PM'."
+            llm_response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": msg}
+                ],
+                temperature=0.15
+            )
 
-    # AI fallback
+            text = llm_response.choices[0].message.content.strip()
+            print("🧠 LLM output:", text)
+
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                raise ValueError("No JSON found in response")
+            event_data = json.loads(match.group(0))
+
+            summary = event_data.get("summary", "Untitled Event")
+            start_time_raw = event_data.get("start_time")
+            end_time_raw = event_data.get("end_time")
+            description = event_data.get("description", "")
+
+            tz = pytz.timezone("Asia/Kolkata")
+            start_dt = dateutil_parser.isoparse(start_time_raw).astimezone(tz)
+            end_dt = dateutil_parser.isoparse(end_time_raw).astimezone(tz)
+            now = datetime.now(tz)
+
+            # 🧩 Auto-correct hallucinated past dates
+            if start_dt <= now:
+                print(f"⚠️ Adjusting {start_dt} → future year")
+                while start_dt <= now:
+                    start_dt += relativedelta(years=1)
+                    end_dt += relativedelta(years=1)
+
+            reply = await add_calendar_event(
+                whatsapp_id,
+                summary,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+                description
+            )
+
+        except Exception as e:
+            print(f"❌ Event creation error: {e}")
+            reply = "⚠️ I couldn’t parse that completely. Try 'Add meeting tomorrow at 4 PM'."
+
+    # 3️⃣ Fallback Chat
     else:
         try:
             r = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are Neura, a friendly WhatsApp assistant that manages Google Calendar and casual chat."},
+                    {"role": "system", "content": "You are Neura, a friendly WhatsApp assistant that manages Google Calendar and chats casually."},
                     {"role": "user", "content": Body}
-                ]
+                ],
+                temperature=0.6
             )
             reply = r.choices[0].message.content.strip()
         except Exception as e:
             reply = f"❌ AI error: {e}"
 
     # Send WhatsApp reply
-    try:
-        twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=reply, to=From)
-        print(f"🤖 Replied to {whatsapp_id}: {reply}")
-    except Exception as e:
-        print(f"⚠️ Failed to send WhatsApp message: {e}")
-
+    twilio_client.messages.create(from_=TWILIO_WHATSAPP_NUMBER, body=reply, to=From)
+    print(f"🤖 Replied to {whatsapp_id}: {reply}")
     return "OK"
