@@ -1,100 +1,59 @@
 # agents/calendar_agent.py
-from groq import Groq
-import os, json, re, pytz
-from dateutil import parser as dateutil_parser
+
+import pytz
 from datetime import datetime, timedelta
-from services.google_calendar import fetch_upcoming_events  # your existing helper
+from dateutil import parser as dateutil_parser
+from services.google_calendar import fetch_upcoming_events
+from db.init_db import async_session
+from db.models import GoogleToken
+from sqlalchemy import select
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# small helper: try to safely parse a YYYY-MM-DD like string,
-# returns None if invalid
-def safe_iso_date(date_str: str):
-    if not date_str or not isinstance(date_str, str):
-        return None
-    date_str = date_str.strip()
-    # reject obvious placeholders like 'YYYY' or 'YYYY-MM-DD'
-    if re.fullmatch(r"Y{2,}|YYYY(-MM(-DD)?)?", date_str, re.IGNORECASE):
-        return None
-    try:
-        # parse only the date part and return YYYY-MM-DD
-        dt = dateutil_parser.isoparse(date_str)
-        return dt.date().isoformat()
-    except Exception:
-        # try general parse (natural language)
-        try:
-            dt = dateutil_parser.parse(date_str, default=datetime.now(pytz.timezone("Asia/Kolkata")))
-            return dt.date().isoformat()
-        except Exception:
-            return None
-
-# If user text contains words like "today"/"tomorrow" etc, map them
-def detect_simple_natural_date(msg: str):
-    m = msg.lower()
-    tz = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(tz)
-    if "tomorrow" in m:
-        return (now + timedelta(days=1)).date().isoformat()
-    if "today" in m:
-        return now.date().isoformat()
-    if "next week" in m:
-        # return the date for next Monday
-        weekday = now.weekday()  # 0=Mon
-        days_until_next_monday = (7 - weekday) % 7
-        days_until_next_monday = days_until_next_monday or 7
-        next_monday = (now + __import__('datetime').timedelta(days=days_until_next_monday)).date()
-        return next_monday.isoformat()
-    return None
-
-async def handle_calendar(msg: str, whatsapp_id: str):
+async def handle_calendar(msg: str, whatsapp_id: str) -> str:
     """
-    Attempt to use the LLM to extract a date; if that fails, fall back to
-    natural-language detection; if that fails, default to today.
-    Then call fetch_upcoming_events(whatsapp_id, date) which returns formatted text.
+    Handles user requests to show or summarize their calendar schedule.
+    Example messages:
+    - "show my schedule"
+    - "what are my events tomorrow"
+    - "show meetings for next week"
     """
+
     try:
-        # 1) Ask LLM to extract a date if you want to rely on the model
-        prompt = """
-        Extract which single date the user wants to view from the message.
-        Return JSON exactly like: {"date": "YYYY-MM-DD"}
-        If the user did not specify a date, return {"date": ""}.
-        Do NOT include any other text.
-        """
-        r = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": msg}],
-            temperature=0
-        )
+        # ────────── Check if user is linked ──────────
+        async with async_session() as session:
+            result = await session.execute(
+                select(GoogleToken).where(GoogleToken.whatsapp_id == whatsapp_id)
+            )
+            token = result.scalars().first()
+            if not token:
+                return "⚠️ No linked Google account. Please link it first using: 'link my Google account'."
 
-        text = (r.choices[0].message.content or "").strip()
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        extracted_date = None
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                extracted_date = safe_iso_date(data.get("date", "") if isinstance(data, dict) else "")
-            except Exception:
-                extracted_date = None
+        tz = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(tz)
 
-        # 2) If LLM gave nothing useful, try simple natural date detection from the text
-        if not extracted_date:
-            extracted_date = detect_simple_natural_date(msg)
+        # ────────── Detect Day from Message ──────────
+        msg_lower = msg.lower()
+        target_date = now
 
-        # 3) Final fallback: use today (Asia/Kolkata)
-        if not extracted_date:
-            tz = pytz.timezone("Asia/Kolkata")
-            extracted_date = datetime.now(tz).date().isoformat()
-            info_note = True
+        if "tomorrow" in msg_lower:
+            target_date = now + timedelta(days=1)
+        elif "next week" in msg_lower:
+            target_date = now + timedelta(days=7)
+        elif "day after" in msg_lower:
+            target_date = now + timedelta(days=2)
+        elif "yesterday" in msg_lower:
+            target_date = now - timedelta(days=1)
         else:
-            info_note = False
+            # Try to extract a specific date if mentioned (e.g., "show my schedule on 10 Nov")
+            try:
+                parsed_date = dateutil_parser.parse(msg, fuzzy=True)
+                target_date = parsed_date.astimezone(tz)
+            except Exception:
+                target_date = now  # fallback to today
 
-        # 4) Fetch events using the normalized date string (YYYY-MM-DD)
-        return_text = await fetch_upcoming_events(whatsapp_id, extracted_date)
-
-        # If we defaulted to today, let user know
-        if info_note:
-            return f"(Showing calendar for {extracted_date})\n\n{return_text}"
-        return return_text
+        # ────────── Fetch Events ──────────
+        response = await fetch_upcoming_events(whatsapp_id, target_date.isoformat())
+        return response
 
     except Exception as e:
         print(f"❌ Calendar agent error: {e}")
